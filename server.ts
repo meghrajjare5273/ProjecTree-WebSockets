@@ -5,6 +5,7 @@ import cors from "cors";
 import { PrismaClient } from "@prisma/client";
 import dotenv from "dotenv";
 import cookie from "cookie";
+// import { tr } from "zod/v4/locales";
 
 dotenv.config();
 
@@ -17,7 +18,9 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   "http://localhost:3000",
   "https://localhost:3000",
-  // Add your Vercel domain here
+  "http://127.0.0.1:3000",
+  "https://127.0.0.1:3000",
+  "http://localhost:3001",
 ].filter(Boolean);
 
 const corsOptions = {
@@ -25,9 +28,8 @@ const corsOptions = {
     origin: string | undefined,
     callback: (err: Error | null, allow?: boolean) => void
   ) => {
-    // Allow requests with no origin (mobile apps, etc.)
+    console.log(`CORS check for origin: ${origin}`); // Keep this for debugging
     if (!origin) return callback(null, true);
-
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -72,11 +74,11 @@ interface AuthenticatedSocket extends Socket {
 }
 
 // Enhanced session validation function
-async function validateSession(sessionId: string) {
+async function validateSessionByToken(token: string) {
   try {
     const session = await prisma.session.findUnique({
       where: {
-        id: sessionId,
+        token: token, // Changed from id to token
         expiresAt: {
           gt: new Date(),
         },
@@ -99,7 +101,7 @@ async function validateSession(sessionId: string) {
 
     // Update session activity
     await prisma.session.update({
-      where: { id: sessionId },
+      where: { id: session.id },
       data: { updatedAt: new Date() },
     });
 
@@ -113,58 +115,25 @@ async function validateSession(sessionId: string) {
 // Middleware to authenticate socket connections
 io.use(async (socket: any, next) => {
   try {
-    let token: string | undefined;
-    let sessionId: string | undefined | null;
-
-    // Try multiple ways to get the session ID
-    const cookieHeader = socket.handshake.headers.cookie;
-    if (cookieHeader) {
-      const cookies = cookie.parse(cookieHeader);
-      // Try different possible cookie names
-      token =
-        cookies["better-auth.session_token"] ||
-        cookies["session"] ||
-        cookies["sessionId"] ||
-        cookies["__Secure-better-auth.session_token"] ||
-        cookies["authjs.session-token"];
-    }
-    if (token) {
-      const sess = await prisma.session.findUnique({
-        where: {
-          token: token
-        },
-        select: {
-          id: true
-        }
-      });
-      sessionId = sess?.id || null;
+    const token = socket.handshake.auth.sessionId; // Client sends token as sessionId
+    if (!token) {
+      console.log("No token provided in handshake.auth.sessionId");
+      return next(new Error("No authentication token provided"));
     }
 
-    // Fallback to auth header or query params
-    if (!sessionId) {
-      sessionId =
-        socket.handshake.auth.sessionId ||
-        socket.handshake.auth.token ||
-        socket.handshake.query.sessionId ||
-        socket.handshake.headers.authorization?.replace("Bearer ", "");
-    }
-
-    if (!sessionId) {
-      console.log("No session ID found in socket handshake");
-      return next(new Error("Authentication required"));
-    }
-
-    const session = await validateSession(sessionId);
+    const session = await validateSessionByToken(token);
     if (!session) {
-      console.log("Invalid session:", sessionId);
+      console.log(`Session validation failed for token: ${token}`);
       return next(new Error("Invalid or expired session"));
     }
 
     socket.userId = session.user.id;
     socket.user = session.user;
-    socket.sessionId = sessionId;
+    socket.sessionId = session.id; // Store actual session ID if needed later
 
-    console.log(`Socket authenticated for user: ${session.user.id}`);
+    console.log(
+      `Socket authenticated for user: ${session.user.id} (socket: ${socket.id})`
+    );
     next();
   } catch (error) {
     console.error("Socket authentication error:", error);
@@ -529,33 +498,35 @@ io.on("connection", (socket: AuthenticatedSocket) => {
 // REST API middleware for authentication
 const authenticateRequest = async (req: any, res: any, next: any) => {
   try {
-    let sessionId: string | undefined;
+    let token: string | undefined;
 
-    // Get session ID from cookies or Authorization header
     if (req.headers.cookie) {
       const cookies = cookie.parse(req.headers.cookie);
-      sessionId =
+      token =
         cookies["better-auth.session_token"] ||
         cookies["session"] ||
         cookies["sessionId"] ||
         cookies["__Secure-better-auth.session_token"];
     }
 
-    if (!sessionId && req.headers.authorization) {
-      sessionId = req.headers.authorization.replace("Bearer ", "");
+    if (!token && req.headers.authorization) {
+      token = req.headers.authorization.replace("Bearer ", "");
     }
 
-    if (!sessionId) {
+    if (!token) {
+      console.log("No token found in cookies or Authorization header");
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const session = await validateSession(sessionId);
+    const session = await validateSessionByToken(token);
     if (!session) {
+      console.log(`Session validation failed for token: ${token}`);
       return res.status(401).json({ error: "Invalid or expired session" });
     }
 
     req.user = session.user;
-    req.sessionId = sessionId;
+    req.sessionId = session.id; // Store session ID if needed
+    console.log(`REST API authenticated for user: ${session.user.id}`);
     next();
   } catch (error) {
     console.error("Request authentication error:", error);
