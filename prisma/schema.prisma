@@ -1,0 +1,172 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+    provider        = "prisma-client-js"
+    previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model User {
+    id               String    @id @default(cuid())
+    email            String    @unique
+    name             String?
+    emailVerified    Boolean
+    image            String?
+    createdAt        DateTime
+    updatedAt        DateTime
+    sessions         Session[]
+    accounts         Account[]
+    projects         Project[]
+    events           Event[]
+    comments         Comment[]
+    username         String?
+    displayUsername  String?
+    location         String?
+    socialLinks      Json?
+    bio              String?
+    interests        String[]
+    skills           String[]
+    sentMessages     Message[] @relation("SentMessages")
+    receivedMessages Message[] @relation("ReceivedMessages")
+    following        Follow[]  @relation("FollowsAsFollower")
+    followers        Follow[]  @relation("FollowsAsFollowing")
+
+    @@unique([username])
+    @@index([username, email, id])
+    @@map("user")
+}
+
+model Comment {
+    id        String   @id @default(cuid())
+    content   String
+    userId    String
+    user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+    projectId String?
+    project   Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    eventId   String?
+    event     Event?   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+    createdAt DateTime @default(now())
+
+    @@index([id, userId, createdAt])
+    @@map("comment")
+}
+
+model Project {
+    id                   String    @id @default(cuid())
+    title                String
+    description          String
+    images               String[] // Array of image URLs
+    tags                 String[] // e.g., ["web", "AI", "hackathon"]
+    userId               String
+    openForCollaboration Boolean   @default(false)
+    user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+    comments             Comment[]
+    createdAt            DateTime  @default(now())
+    updatedAt            DateTime  @updatedAt
+
+    @@index([userId, id, createdAt])
+    @@map("project")
+}
+
+model Event {
+    id          String    @id @default(cuid())
+    title       String
+    description String
+    date        DateTime
+    location    String?
+    organizer   String?
+    images      String[]
+    userId      String
+    user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+    comments    Comment[]
+    createdAt   DateTime  @default(now())
+    updatedAt   DateTime  @updatedAt
+
+    @@index([id, userId, createdAt])
+    @@map("event")
+}
+
+model Session {
+    id        String   @id
+    expiresAt DateTime
+    token     String
+    createdAt DateTime
+    updatedAt DateTime
+    ipAddress String?
+    userAgent String?
+    userId    String
+    user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@unique([token])
+    @@index([userId, id])
+    @@map("session")
+}
+
+model Account {
+    id                    String    @id
+    accountId             String
+    providerId            String
+    userId                String
+    user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+    accessToken           String?
+    refreshToken          String?
+    idToken               String?
+    accessTokenExpiresAt  DateTime?
+    refreshTokenExpiresAt DateTime?
+    scope                 String?
+    password              String?
+    createdAt             DateTime
+    updatedAt             DateTime
+
+    @@index([id])
+    @@map("account")
+}
+
+model Verification {
+    id         String    @id
+    identifier String
+    value      String
+    expiresAt  DateTime
+    createdAt  DateTime?
+    updatedAt  DateTime?
+
+    @@index([id])
+    @@map("verification")
+}
+
+model Message {
+    id         String   @id @default(cuid())
+    content    String
+    senderId   String
+    receiverId String
+    createdAt  DateTime @default(now())
+    read       Boolean  @default(false)
+
+    sender   User @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+    receiver User @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+
+    @@index([senderId, receiverId, createdAt])
+    @@map("message")
+}
+
+model Follow {
+    id          String   @id @default(cuid())
+    followerId  String
+    followingId String
+    createdAt   DateTime @default(now())
+
+    follower  User @relation("FollowsAsFollower", fields: [followerId], references: [id], onDelete: Cascade)
+    following User @relation("FollowsAsFollowing", fields: [followingId], references: [id], onDelete: Cascade)
+
+    @@unique([followerId, followingId])
+    @@index([followerId])
+    @@index([followingId])
+}
