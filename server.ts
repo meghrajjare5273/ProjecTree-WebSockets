@@ -5,7 +5,8 @@ import cors from "cors";
 import { PrismaClient } from "@prisma/client";
 import dotenv from "dotenv";
 import cookie from "cookie";
-// import { tr } from "zod/v4/locales";
+import { auth } from "./auth"; // Import your Better Auth instance
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 
 dotenv.config();
 
@@ -42,7 +43,10 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(express.json());
+// app.use(express.json());
+
+// Better Auth routes - must be before other middleware
+app.all("/api/auth/*splat", toNodeHandler(auth));
 
 // Socket.io server with CORS
 const io = new Server(httpServer, {
@@ -73,41 +77,52 @@ interface AuthenticatedSocket extends Socket {
   };
 }
 
-// Enhanced session validation function
-async function validateSessionByToken(token: string) {
+// Enhanced session validation function using Better Auth
+async function validateSessionFromHeaders(headers: any) {
   try {
-    const session = await prisma.session.findUnique({
-      where: {
-        token: token, // Changed from id to token
-        expiresAt: {
-          gt: new Date(),
-        },
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            image: true,
-          },
-        },
-      },
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(headers),
     });
 
-    if (!session || !session.user) {
+    if (!session?.user) {
       return null;
     }
 
-    // Update session activity
-    await prisma.session.update({
-      where: { id: session.id },
-      data: { updatedAt: new Date() },
-    });
-
-    return session;
+    return {
+      user: session.user,
+      session: session.session,
+    };
   } catch (error) {
     console.error("Session validation error:", error);
+    return null;
+  }
+}
+
+// Helper function to validate session from socket handshake
+async function validateSocketSession(socket: any) {
+  try {
+    // Try to get session from cookie in handshake headers
+    const cookieHeader = socket.handshake.headers.cookie;
+    let headers: any = {};
+
+    if (cookieHeader) {
+      headers.cookie = cookieHeader;
+    }
+
+    // Also check for authorization header or token in auth
+    if (socket.handshake.auth.token) {
+      headers.authorization = `Bearer ${socket.handshake.auth.token}`;
+    }
+
+    // If sessionId is provided in auth, treat it as a token
+    if (socket.handshake.auth.sessionId) {
+      headers.authorization = `Bearer ${socket.handshake.auth.sessionId}`;
+    }
+
+    const authResult = await validateSessionFromHeaders(headers);
+    return authResult;
+  } catch (error) {
+    console.error("Socket session validation error:", error);
     return null;
   }
 }
@@ -115,24 +130,24 @@ async function validateSessionByToken(token: string) {
 // Middleware to authenticate socket connections
 io.use(async (socket: any, next) => {
   try {
-    const token = socket.handshake.auth.sessionId; // Client sends token as sessionId
-    if (!token) {
-      console.log("No token provided in handshake.auth.sessionId");
-      return next(new Error("No authentication token provided"));
-    }
+    const authResult = await validateSocketSession(socket);
 
-    const session = await validateSessionByToken(token);
-    if (!session) {
-      console.log(`Session validation failed for token: ${token}`);
+    if (!authResult) {
+      console.log("Socket authentication failed - no valid session");
       return next(new Error("Invalid or expired session"));
     }
 
-    socket.userId = session.user.id;
-    socket.user = session.user;
-    socket.sessionId = session.id; // Store actual session ID if needed later
+    socket.userId = authResult.user.id;
+    socket.user = {
+      id: authResult.user.id,
+      name: authResult.user.name,
+      email: authResult.user.email,
+      image: authResult.user.image,
+    };
+    socket.sessionId = authResult.session?.id;
 
     console.log(
-      `Socket authenticated for user: ${session.user.id} (socket: ${socket.id})`
+      `Socket authenticated for user: ${authResult.user.id} (socket: ${socket.id})`
     );
     next();
   } catch (error) {
@@ -495,38 +510,19 @@ io.on("connection", (socket: AuthenticatedSocket) => {
   });
 });
 
-// REST API middleware for authentication
+// REST API middleware for authentication using Better Auth
 const authenticateRequest = async (req: any, res: any, next: any) => {
   try {
-    let token: string | undefined;
+    const authResult = await validateSessionFromHeaders(req.headers);
 
-    if (req.headers.cookie) {
-      const cookies = cookie.parse(req.headers.cookie);
-      token =
-        cookies["better-auth.session_token"] ||
-        cookies["session"] ||
-        cookies["sessionId"] ||
-        cookies["__Secure-better-auth.session_token"];
-    }
-
-    if (!token && req.headers.authorization) {
-      token = req.headers.authorization.replace("Bearer ", "");
-    }
-
-    if (!token) {
-      console.log("No token found in cookies or Authorization header");
+    if (!authResult) {
+      console.log("REST API authentication failed - no valid session");
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const session = await validateSessionByToken(token);
-    if (!session) {
-      console.log(`Session validation failed for token: ${token}`);
-      return res.status(401).json({ error: "Invalid or expired session" });
-    }
-
-    req.user = session.user;
-    req.sessionId = session.id; // Store session ID if needed
-    console.log(`REST API authenticated for user: ${session.user.id}`);
+    req.user = authResult.user;
+    req.session = authResult.session;
+    console.log(`REST API authenticated for user: ${authResult.user.id}`);
     next();
   } catch (error) {
     console.error("Request authentication error:", error);
@@ -542,6 +538,12 @@ app.get("/health", (req, res) => {
     activeConnections: activeUsers.size,
     totalSockets: userSockets.size,
   });
+});
+
+// Get current user session info
+app.get("/api/me", async (req, res) => {
+  const authResult = await validateSessionFromHeaders(req.headers);
+  res.json(authResult);
 });
 
 // Get online users (protected route)

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx server-temp.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "postbuild": "prisma generate"
@@ -14,7 +14,7 @@
     "@prisma/adapter-neon": "^6.4.1",
     "@prisma/client": "^6.5.0",
     "@socket.io/redis-adapter": "^8.3.0",
-    "better-auth": "^1.2.7",
+    "better-auth": "^1.2.8",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
@@ -25,6 +25,7 @@
   "devDependencies": {
     "@types/cookie": "^0.6.0",
     "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.3",
     "@types/node": "^20",
     "prisma": "^6.5.0",
     "tsx": "^4.19.4",
