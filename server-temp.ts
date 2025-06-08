@@ -8,11 +8,11 @@ const app = express();
 const httpServer = createServer(app);
 
 // // app.all("/api/auth/*", toNodeHandler(auth)); // For ExpressJS v4
-// app.all("/api/auth/*splat", toNodeHandler(auth)); //For ExpressJS v5
+app.all("/api/auth/*splat", toNodeHandler(auth)); //For ExpressJS v5
 
 // // Mount express json middleware after Better Auth handler
 // // or only apply it to routes that don't interact with Better Auth
-// app.use(express.json());
+app.use(express.json());
 
 app.get("/api/me", async (req, res) => {
   const session = await auth.api.getSession({
