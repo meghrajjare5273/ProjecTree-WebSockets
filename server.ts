@@ -474,45 +474,52 @@ io.on("connection", async (socket) => {
   // Handle getting conversation list
   socket.on("get_conversations", async () => {
     try {
+      // Alternative approach using window functions instead of DISTINCT ON
       const conversations = await prisma.$queryRaw`
-        WITH latest_messages AS (
-          SELECT DISTINCT ON (
-            CASE 
-              WHEN "senderId" = ${socket.userId} THEN "receiverId"
-              ELSE "senderId"
-            END
-          )
+      WITH ranked_messages AS (
+        SELECT 
+          *,
           CASE 
             WHEN "senderId" = ${socket.userId} THEN "receiverId"
             ELSE "senderId"
           END as other_user_id,
-          *
-          FROM "message"
-          WHERE "senderId" = ${socket.userId} OR "receiverId" = ${socket.userId}
-          ORDER BY 
-            CASE 
-              WHEN "senderId" = ${socket.userId} THEN "receiverId"
-              ELSE "senderId"
-            END,
-            "createdAt" DESC
-        )
-        SELECT 
-          lm.*,
-          u.name,
-          u.username,
-          u.image,
-          u.id as user_id,
-          (
-            SELECT COUNT(*)::int
-            FROM "message" m2
-            WHERE m2."senderId" = lm.other_user_id 
-            AND m2."receiverId" = ${socket.userId}
-            AND m2.read = false
-          ) as unread_count
-        FROM latest_messages lm
-        JOIN "user" u ON u.id = lm.other_user_id
-        ORDER BY lm."createdAt" DESC
-      `;
+          ROW_NUMBER() OVER (
+            PARTITION BY 
+              CASE 
+                WHEN "senderId" = ${socket.userId} THEN "receiverId"
+                ELSE "senderId"
+              END
+            ORDER BY "createdAt" DESC
+          ) as rn
+        FROM "message"
+        WHERE "senderId" = ${socket.userId} OR "receiverId" = ${socket.userId}
+      ),
+      latest_messages AS (
+        SELECT * FROM ranked_messages WHERE rn = 1
+      )
+      SELECT 
+        lm.id,
+        lm.content,
+        lm."senderId",
+        lm."receiverId", 
+        lm."createdAt",
+        lm.read,
+        lm.other_user_id,
+        u.name,
+        u.username,
+        u.image,
+        u.id as user_id,
+        COALESCE((
+          SELECT COUNT(*)::int
+          FROM "message" m2
+          WHERE m2."senderId" = lm.other_user_id 
+          AND m2."receiverId" = ${socket.userId}
+          AND m2.read = false
+        ), 0) as unread_count
+      FROM latest_messages lm
+      JOIN "user" u ON u.id = lm.other_user_id
+      ORDER BY lm."createdAt" DESC
+    `;
 
       socket.emit("conversations", conversations);
     } catch (error) {
