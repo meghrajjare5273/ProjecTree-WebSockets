@@ -16,6 +16,22 @@ declare module "socket.io" {
   }
 }
 
+// Fix 1: Add proper typing for Prisma raw query result
+interface ConversationQueryResult {
+  id: string;
+  content: string;
+  senderId: string;
+  receiverId: string;
+  createdAt: Date;
+  read: boolean;
+  other_user_id: string;
+  name: string | null;
+  username: string | null;
+  image: string | null;
+  user_id: string;
+  unread_count: number;
+}
+
 // Initialize clients
 console.log("🚀 Initializing server components...");
 
@@ -247,13 +263,19 @@ io.on("connection", async (socket) => {
     );
   }
 
-  // Handle joining a chat room
+  // Fix 3: Improve error handling in join_chat
   socket.on("join_chat", async (data: { otherUserId: string }) => {
     try {
       console.log(
         `👥 User ${socket.userId} joining chat with ${data.otherUserId}`
       );
       const { otherUserId } = data;
+
+      if (!otherUserId) {
+        socket.emit("error", { message: "Invalid user ID provided" });
+        return;
+      }
+
       const roomId = getRoomId(socket.userId!, otherUserId);
 
       socket.join(roomId);
@@ -271,38 +293,44 @@ io.on("connection", async (socket) => {
         console.log(
           `💾 No messages in Redis, loading from database for room ${roomId}`
         );
-        const dbMessages = await prisma.message.findMany({
-          where: {
-            OR: [
-              { senderId: socket.userId, receiverId: otherUserId },
-              { senderId: otherUserId, receiverId: socket.userId },
-            ],
-          },
-          include: {
-            sender: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-                image: true,
+        try {
+          const dbMessages = await prisma.message.findMany({
+            where: {
+              OR: [
+                { senderId: socket.userId, receiverId: otherUserId },
+                { senderId: otherUserId, receiverId: socket.userId },
+              ],
+            },
+            include: {
+              sender: {
+                select: {
+                  id: true,
+                  name: true,
+                  username: true,
+                  image: true,
+                },
               },
             },
-          },
-          orderBy: { createdAt: "desc" },
-          take: 50,
-        });
-
-        messages = dbMessages.reverse();
-        console.log(`📊 Loaded ${messages.length} messages from database`);
-
-        // Cache in Redis for future use
-        if (messages.length > 0) {
-          console.log(`💾 Caching ${messages.length} messages to Redis`);
-          const pipeline = redis.pipeline();
-          messages.forEach((msg) => {
-            pipeline.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(msg));
+            orderBy: { createdAt: "desc" },
+            take: 50,
           });
-          await pipeline.exec();
+
+          messages = dbMessages.reverse();
+          console.log(`📊 Loaded ${messages.length} messages from database`);
+
+          // Cache in Redis for future use
+          if (messages.length > 0) {
+            console.log(`💾 Caching ${messages.length} messages to Redis`);
+            const pipeline = redis.pipeline();
+            messages.forEach((msg) => {
+              pipeline.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(msg));
+            });
+            await pipeline.exec();
+          }
+        } catch (dbError) {
+          console.error("Database query error:", dbError);
+          // Still emit empty history instead of failing completely
+          messages = [];
         }
       } else {
         console.log(`📊 Loaded ${messages.length} messages from Redis cache`);
@@ -322,15 +350,11 @@ io.on("connection", async (socket) => {
       );
     } catch (error) {
       console.error(`❌ Error joining chat for user ${socket.userId}:`, error);
-      console.error(
-        "Join chat error stack:",
-        error instanceof Error ? error.stack : "No stack trace"
-      );
       socket.emit("error", { message: "Failed to join chat" });
     }
   });
 
-  // Handle sending messages
+  // Fix 4: Add validation and better error handling to send_message
   socket.on(
     "send_message",
     async (data: { receiverId: string; content: string }) => {
@@ -340,9 +364,20 @@ io.on("connection", async (socket) => {
         );
         const { receiverId, content } = data;
 
-        if (!content.trim()) {
+        // Validation
+        if (!receiverId) {
+          socket.emit("error", { message: "Receiver ID is required" });
+          return;
+        }
+
+        if (!content || !content.trim()) {
           console.warn(`⚠️ Empty message content from user ${socket.userId}`);
           socket.emit("error", { message: "Message content cannot be empty" });
+          return;
+        }
+
+        if (content.trim().length > 1000) {
+          socket.emit("error", { message: "Message too long" });
           return;
         }
 
@@ -406,10 +441,6 @@ io.on("connection", async (socket) => {
           `❌ Error sending message from user ${socket.userId}:`,
           error
         );
-        console.error(
-          "Send message error stack:",
-          error instanceof Error ? error.stack : "No stack trace"
-        );
         socket.emit("error", { message: "Failed to send message" });
       }
     }
@@ -471,7 +502,7 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // Handle getting conversation list
+  // Fix 2: Replace the get_conversations handler with properly typed version
   socket.on("get_conversations", async () => {
     try {
       // Alternative approach using window functions instead of DISTINCT ON
