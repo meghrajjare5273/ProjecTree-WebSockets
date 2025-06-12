@@ -16,8 +16,8 @@ declare module "socket.io" {
   }
 }
 
-// Fix 1: Add proper typing for Prisma raw query result
-interface ConversationQueryResult {
+// Fix 1: Update the conversation interface to match actual data structure
+interface ConversationData {
   id: string;
   content: string;
   senderId: string;
@@ -233,6 +233,76 @@ const getUnreadCount = async (userId: string) => {
   }
 };
 
+// Fix 2: Optimized function to get conversations with single query
+const getConversationsForUser = async (
+  userId: string
+): Promise<ConversationData[]> => {
+  try {
+    // Get all messages where user is sender or receiver, with latest message per conversation
+    const conversations = await prisma.$queryRaw<any[]>`
+      WITH ranked_messages AS (
+        SELECT 
+          m.*,
+          u.name,
+          u.username,
+          u.image,
+          CASE 
+            WHEN m."senderId" = ${userId} THEN m."receiverId"
+            ELSE m."senderId"
+          END as other_user_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY CASE 
+              WHEN m."senderId" = ${userId} THEN m."receiverId"
+              ELSE m."senderId"
+            END
+            ORDER BY m."createdAt" DESC
+          ) as rn
+        FROM "message" m
+        JOIN "user" u ON (
+          CASE 
+            WHEN m."senderId" = ${userId} THEN u.id = m."receiverId"
+            ELSE u.id = m."senderId"
+          END
+        )
+        WHERE m."senderId" = ${userId} OR m."receiverId" = ${userId}
+      ),
+      unread_counts AS (
+        SELECT 
+          "senderId" as other_user_id,
+          COUNT(*) as unread_count
+        FROM "message"
+        WHERE "receiverId" = ${userId} AND "read" = false
+        GROUP BY "senderId"
+      )
+      SELECT 
+        rm.*,
+        COALESCE(uc.unread_count, 0) as unread_count
+      FROM ranked_messages rm
+      LEFT JOIN unread_counts uc ON rm.other_user_id = uc.other_user_id
+      WHERE rm.rn = 1
+      ORDER BY rm."createdAt" DESC
+    `;
+
+    return conversations.map((conv: any) => ({
+      id: conv.id,
+      content: conv.content,
+      senderId: conv.senderId,
+      receiverId: conv.receiverId,
+      createdAt: conv.createdAt,
+      read: conv.read,
+      other_user_id: conv.other_user_id,
+      name: conv.name,
+      username: conv.username,
+      image: conv.image,
+      user_id: conv.other_user_id,
+      unread_count: Number(conv.unread_count) || 0,
+    }));
+  } catch (error) {
+    console.error("Error in getConversationsForUser:", error);
+    throw error;
+  }
+};
+
 // Socket.IO connection handling
 io.on("connection", async (socket) => {
   try {
@@ -263,7 +333,6 @@ io.on("connection", async (socket) => {
     );
   }
 
-  // Fix 3: Improve error handling in join_chat
   socket.on("join_chat", async (data: { otherUserId: string }) => {
     try {
       console.log(
@@ -277,80 +346,58 @@ io.on("connection", async (socket) => {
       }
 
       const roomId = getRoomId(socket.userId!, otherUserId);
-
       socket.join(roomId);
       console.log(`🏠 User ${socket.userId} joined room: ${roomId}`);
 
-      // Load recent messages from Redis first (faster)
-      console.log(`📜 Loading recent messages from Redis for room ${roomId}`);
       let messages = await getRecentMessagesFromRedis(
         socket.userId!,
         otherUserId
       );
 
-      // If no messages in Redis, load from database
       if (messages.length === 0) {
         console.log(
           `💾 No messages in Redis, loading from database for room ${roomId}`
         );
-        try {
-          const dbMessages = await prisma.message.findMany({
-            where: {
-              OR: [
-                { senderId: socket.userId, receiverId: otherUserId },
-                { senderId: otherUserId, receiverId: socket.userId },
-              ],
+        const dbMessages = await prisma.message.findMany({
+          where: {
+            OR: [
+              { senderId: socket.userId, receiverId: otherUserId },
+              { senderId: otherUserId, receiverId: socket.userId },
+            ],
+          },
+          include: {
+            sender: {
+              select: { id: true, name: true, username: true, image: true },
             },
-            include: {
-              sender: {
-                select: {
-                  id: true,
-                  name: true,
-                  username: true,
-                  image: true,
-                },
-              },
-            },
-            orderBy: { createdAt: "desc" },
-            take: 50,
-          });
+          },
+          orderBy: { createdAt: "desc" },
+          take: 50,
+        });
+        messages = dbMessages.reverse();
+        console.log(`📊 Loaded ${messages.length} messages from database`);
 
-          messages = dbMessages.reverse();
-          console.log(`📊 Loaded ${messages.length} messages from database`);
-
-          // Cache in Redis for future use
-          if (messages.length > 0) {
-            console.log(`💾 Caching ${messages.length} messages to Redis`);
-            const pipeline = redis.pipeline();
-            messages.forEach((msg) => {
-              pipeline.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(msg));
-            });
-            await pipeline.exec();
-          }
-        } catch (dbError) {
-          console.error("Database query error:", dbError);
-          // Still emit empty history instead of failing completely
-          messages = [];
+        if (messages.length > 0) {
+          const pipeline = redis.pipeline();
+          messages.forEach((msg) =>
+            pipeline.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(msg))
+          );
+          await pipeline.exec();
         }
       } else {
         console.log(`📊 Loaded ${messages.length} messages from Redis cache`);
       }
 
       socket.emit("chat_history", messages);
+      console.log(
+        `📡 Emitted chat_history with ${messages.length} messages to ${socket.userId}`
+      ); // Added log
 
-      // Mark messages as read
-      console.log(`✅ Marking messages as read for user ${socket.userId}`);
       await markMessagesAsRead(otherUserId, socket.userId!);
-
-      // Update unread count
       const newUnreadCount = await getUnreadCount(socket.userId!);
       socket.emit("unread_count", newUnreadCount);
-      console.log(
-        `📧 Updated unread count (${newUnreadCount}) for user ${socket.userId}`
-      );
     } catch (error) {
-      console.error(`❌ Error joining chat for user ${socket.userId}:`, error);
-      socket.emit("error", { message: "Failed to join chat" });
+      console.error(`❌ Error in join_chat for user ${socket.userId}:`, error);
+      socket.emit("error", { message: "Failed to load chat history" });
     }
   });
 
@@ -378,6 +425,17 @@ io.on("connection", async (socket) => {
 
         if (content.trim().length > 1000) {
           socket.emit("error", { message: "Message too long" });
+          return;
+        }
+
+        // Validate receiver exists
+        const receiver = await prisma.user.findUnique({
+          where: { id: receiverId },
+          select: { id: true },
+        });
+
+        if (!receiver) {
+          socket.emit("error", { message: "Receiver not found" });
           return;
         }
 
@@ -502,60 +560,71 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // Fix 2: Replace the get_conversations handler with properly typed version
+  // Fix 5: Optimized get_conversations handler
   socket.on("get_conversations", async () => {
     try {
-      // Alternative approach using window functions instead of DISTINCT ON
-      const conversations = await prisma.$queryRaw`
-      WITH ranked_messages AS (
-        SELECT 
-          *,
-          CASE 
-            WHEN "senderId" = ${socket.userId} THEN "receiverId"
-            ELSE "senderId"
-          END as other_user_id,
-          ROW_NUMBER() OVER (
-            PARTITION BY 
-              CASE 
-                WHEN "senderId" = ${socket.userId} THEN "receiverId"
-                ELSE "senderId"
-              END
-            ORDER BY "createdAt" DESC
-          ) as rn
-        FROM "message"
-        WHERE "senderId" = ${socket.userId} OR "receiverId" = ${socket.userId}
-      ),
-      latest_messages AS (
-        SELECT * FROM ranked_messages WHERE rn = 1
-      )
-      SELECT 
-        lm.id,
-        lm.content,
-        lm."senderId",
-        lm."receiverId", 
-        lm."createdAt",
-        lm.read,
-        lm.other_user_id,
-        u.name,
-        u.username,
-        u.image,
-        u.id as user_id,
-        COALESCE((
-          SELECT COUNT(*)::int
-          FROM "message" m2
-          WHERE m2."senderId" = lm.other_user_id 
-          AND m2."receiverId" = ${socket.userId}
-          AND m2.read = false
-        ), 0) as unread_count
-      FROM latest_messages lm
-      JOIN "user" u ON u.id = lm.other_user_id
-      ORDER BY lm."createdAt" DESC
-    `;
+      console.log(`📋 Getting conversations for user ${socket.userId}`);
 
+      const conversations = await getConversationsForUser(socket.userId!);
+
+      console.log(`✅ Retrieved ${conversations.length} conversations`);
       socket.emit("conversations", conversations);
     } catch (error) {
-      console.error("Error getting conversations:", error);
+      console.error(
+        `❌ Error getting conversations for user ${socket.userId}:`,
+        error
+      );
+      console.error("Error details:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : "No stack trace",
+      });
       socket.emit("error", { message: "Failed to get conversations" });
+    }
+  });
+
+  //Handle Old Messages
+  socket.on("load_more_messages", async (data) => {
+    try {
+      const { otherUserId, before } = data;
+      if (!otherUserId || !before) {
+        socket.emit("error", { message: "Invalid parameters" });
+        return;
+      }
+
+      const roomId = getRoomId(socket.userId!, otherUserId);
+      if (!socket.rooms.has(roomId)) {
+        socket.emit("error", { message: "Not in chat room" });
+        return;
+      }
+
+      const olderMessages = await prisma.message.findMany({
+        where: {
+          OR: [
+            { senderId: socket.userId, receiverId: otherUserId },
+            { senderId: otherUserId, receiverId: socket.userId },
+          ],
+          createdAt: { lt: new Date(before) },
+        },
+        include: {
+          sender: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+              image: true,
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 50,
+      });
+
+      // Reverse to send messages in ascending order (oldest first)
+      const sortedOlderMessages = olderMessages.reverse();
+      socket.emit("more_messages", sortedOlderMessages);
+    } catch (error) {
+      console.error("Error loading more messages:", error);
+      socket.emit("error", { message: "Failed to load more messages" });
     }
   });
 
