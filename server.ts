@@ -333,31 +333,20 @@ io.on("connection", async (socket) => {
     );
   }
 
-  socket.on("join_chat", async (data: { otherUserId: string }) => {
+  socket.on("join_chat", async (data: { otherUserId: string }, callback) => {
     try {
-      console.log(
-        `👥 User ${socket.userId} joining chat with ${data.otherUserId}`
-      );
       const { otherUserId } = data;
-
       if (!otherUserId) {
-        socket.emit("error", { message: "Invalid user ID provided" });
+        callback({ error: "Invalid user ID provided" });
         return;
       }
-
       const roomId = getRoomId(socket.userId!, otherUserId);
       socket.join(roomId);
-      console.log(`🏠 User ${socket.userId} joined room: ${roomId}`);
-
       let messages = await getRecentMessagesFromRedis(
         socket.userId!,
         otherUserId
       );
-
       if (messages.length === 0) {
-        console.log(
-          `💾 No messages in Redis, loading from database for room ${roomId}`
-        );
         const dbMessages = await prisma.message.findMany({
           where: {
             OR: [
@@ -374,8 +363,6 @@ io.on("connection", async (socket) => {
           take: 50,
         });
         messages = dbMessages.reverse();
-        console.log(`📊 Loaded ${messages.length} messages from database`);
-
         if (messages.length > 0) {
           const pipeline = redis.pipeline();
           messages.forEach((msg) =>
@@ -383,24 +370,18 @@ io.on("connection", async (socket) => {
           );
           await pipeline.exec();
         }
-      } else {
-        console.log(`📊 Loaded ${messages.length} messages from Redis cache`);
       }
-
-      socket.emit("chat_history", messages);
-      console.log(
-        `📡 Emitted chat_history with ${messages.length} messages to ${socket.userId}`
-      ); // Added log
-
+      // Send messages back via callback
+      callback({ messages });
+      // Additional server logic (e.g., marking messages as read)
       await markMessagesAsRead(otherUserId, socket.userId!);
       const newUnreadCount = await getUnreadCount(socket.userId!);
-      socket.emit("unread_count", newUnreadCount);
+      io.to(`user:${socket.userId}`).emit("unread_count", newUnreadCount);
     } catch (error) {
       console.error(`❌ Error in join_chat for user ${socket.userId}:`, error);
-      socket.emit("error", { message: "Failed to load chat history" });
+      callback({ error: "Failed to load chat history" });
     }
   });
-
   // Fix 4: Add validation and better error handling to send_message
   socket.on(
     "send_message",
@@ -628,22 +609,47 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // Handle disconnect
-  socket.on("disconnect", async () => {
+  // Handle disconnect with enhanced logic
+  socket.on("disconnect", async (reason) => {
     try {
-      console.log(`👋 User ${socket.userId} disconnected`);
+      console.log(`👋 User ${socket.userId} disconnected: ${reason}`);
 
-      // Remove user socket mapping
-      await redis.hdel(USER_SOCKET_KEY, socket.userId!);
-      console.log(`🗑️ Removed socket mapping for user ${socket.userId}`);
-
-      // Clean up typing indicators
-      const keys = await redis.keys(`${TYPING_PREFIX}*:${socket.userId}`);
-      if (keys.length > 0) {
-        await redis.del(...keys);
+      // Don't clean up immediately for transport errors - they might reconnect
+      if (
+        reason === "transport error" ||
+        reason === "transport close" ||
+        reason == "client namespace disconnect"
+      ) {
         console.log(
-          `🧹 Cleaned up ${keys.length} typing indicators for user ${socket.userId}`
+          `⏳ Delaying cleanup for user ${socket.userId} due to transport issue`
         );
+
+        setTimeout(async () => {
+          try {
+            // Check if user has reconnected by looking for active socket
+            const currentSocketId = await redis.hget(
+              USER_SOCKET_KEY,
+              socket.userId!
+            );
+
+            // Clean up only if this socket is still the active one (user hasn't reconnected)
+            if (currentSocketId === socket.id) {
+              await cleanup();
+            } else {
+              console.log(
+                `🔄 User ${socket.userId} has reconnected, skipping cleanup`
+              );
+            }
+          } catch (error) {
+            console.error(
+              `❌ Error during delayed cleanup for user ${socket.userId}:`,
+              error
+            );
+          }
+        }, 8000);
+      } else {
+        // For normal disconnects (client close, server shutdown, etc.), clean up immediately
+        await cleanup();
       }
     } catch (error) {
       console.error(

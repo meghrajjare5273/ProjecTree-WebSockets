@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "tsc",
+    "build": "tsc server.ts",
     "start": "node dist/server.js",
     "postbuild": "prisma generate"
   },
