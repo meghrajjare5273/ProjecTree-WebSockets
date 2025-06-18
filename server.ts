@@ -16,7 +16,7 @@ declare module "socket.io" {
   }
 }
 
-// Fix 1: Update the conversation interface to match actual data structure
+// Fix 1: Updated conversation interface to match actual data structure
 interface ConversationData {
   id: string;
   content: string;
@@ -30,6 +30,22 @@ interface ConversationData {
   image: string | null;
   user_id: string;
   unread_count: number;
+}
+
+// Fix 2: Add proper message interface for type safety
+interface MessageData {
+  id: string;
+  content: string;
+  senderId: string;
+  receiverId: string;
+  createdAt: Date;
+  read: boolean;
+  sender: {
+    id: string;
+    name: string | null;
+    username: string | null;
+    image: string | null;
+  };
 }
 
 // Initialize clients
@@ -150,24 +166,39 @@ const getRoomId = (userId1: string, userId2: string): string => {
   return [userId1, userId2].sort().join(":");
 };
 
-const saveMessageToRedis = async (message: any) => {
-  const roomId = getRoomId(message.senderId, message.receiverId);
-  await redis.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(message));
-  // Keep only last 100 messages in Redis for quick access
-  await redis.ltrim(`${ROOM_PREFIX}${roomId}`, 0, 99);
+// Fix 3: Improved Redis message caching with proper typing
+const saveMessageToRedis = async (message: MessageData): Promise<void> => {
+  try {
+    const roomId = getRoomId(message.senderId, message.receiverId);
+    await redis.lpush(`${ROOM_PREFIX}${roomId}`, JSON.stringify(message));
+    // Keep only last 100 messages in Redis for quick access
+    await redis.ltrim(`${ROOM_PREFIX}${roomId}`, 0, 99);
+  } catch (error) {
+    console.error("Error saving message to Redis:", error);
+    throw error;
+  }
 };
 
-const getRecentMessagesFromRedis = async (userId1: string, userId2: string) => {
-  const roomId = getRoomId(userId1, userId2);
-  const messages = await redis.lrange(`${ROOM_PREFIX}${roomId}`, 0, 49);
-  return messages.map((msg) => JSON.parse(msg)).reverse();
+// Fix 4: Better error handling for Redis message retrieval
+const getRecentMessagesFromRedis = async (
+  userId1: string,
+  userId2: string
+): Promise<MessageData[]> => {
+  try {
+    const roomId = getRoomId(userId1, userId2);
+    const messages = await redis.lrange(`${ROOM_PREFIX}${roomId}`, 0, 49);
+    return messages.map((msg) => JSON.parse(msg)).reverse();
+  } catch (error) {
+    console.error("Error getting messages from Redis:", error);
+    return [];
+  }
 };
 
 const saveMessageToDatabase = async (messageData: {
   content: string;
   senderId: string;
   receiverId: string;
-}) => {
+}): Promise<MessageData> => {
   try {
     console.log(`💾 Attempting to save message to database:`, {
       senderId: messageData.senderId,
@@ -190,7 +221,7 @@ const saveMessageToDatabase = async (messageData: {
     });
 
     console.log(`✅ Message saved successfully with ID: ${message.id}`);
-    return message;
+    return message as MessageData;
   } catch (error) {
     console.error("❌ Failed to save message to database:", error);
     console.error("Database error details:", {
@@ -202,7 +233,10 @@ const saveMessageToDatabase = async (messageData: {
   }
 };
 
-const markMessagesAsRead = async (senderId: string, receiverId: string) => {
+const markMessagesAsRead = async (
+  senderId: string,
+  receiverId: string
+): Promise<void> => {
   try {
     await prisma.message.updateMany({
       where: {
@@ -216,10 +250,11 @@ const markMessagesAsRead = async (senderId: string, receiverId: string) => {
     });
   } catch (error) {
     console.error("Failed to mark messages as read:", error);
+    throw error;
   }
 };
 
-const getUnreadCount = async (userId: string) => {
+const getUnreadCount = async (userId: string): Promise<number> => {
   try {
     return await prisma.message.count({
       where: {
@@ -233,7 +268,7 @@ const getUnreadCount = async (userId: string) => {
   }
 };
 
-// Fix 2: Optimized function to get conversations with single query
+// Fix 5: Optimized function to get conversations with proper error handling
 const getConversationsForUser = async (
   userId: string
 ): Promise<ConversationData[]> => {
@@ -333,19 +368,38 @@ io.on("connection", async (socket) => {
     );
   }
 
+  // Fix 6: Better error handling and validation for join_chat
   socket.on("join_chat", async (data: { otherUserId: string }, callback) => {
     try {
       const { otherUserId } = data;
-      if (!otherUserId) {
-        callback({ error: "Invalid user ID provided" });
+
+      // Validation
+      if (!otherUserId || typeof otherUserId !== "string") {
+        const error = { error: "Invalid user ID provided" };
+        callback(error);
         return;
       }
+
+      // Verify other user exists
+      const otherUser = await prisma.user.findUnique({
+        where: { id: otherUserId },
+        select: { id: true },
+      });
+
+      if (!otherUser) {
+        const error = { error: "User not found" };
+        callback(error);
+        return;
+      }
+
       const roomId = getRoomId(socket.userId!, otherUserId);
       socket.join(roomId);
+
       let messages = await getRecentMessagesFromRedis(
         socket.userId!,
         otherUserId
       );
+
       if (messages.length === 0) {
         const dbMessages = await prisma.message.findMany({
           where: {
@@ -362,7 +416,10 @@ io.on("connection", async (socket) => {
           orderBy: { createdAt: "desc" },
           take: 50,
         });
-        messages = dbMessages.reverse();
+
+        messages = dbMessages.reverse() as MessageData[];
+
+        // Cache messages in Redis for future requests
         if (messages.length > 0) {
           const pipeline = redis.pipeline();
           messages.forEach((msg) =>
@@ -371,9 +428,11 @@ io.on("connection", async (socket) => {
           await pipeline.exec();
         }
       }
+
       // Send messages back via callback
       callback({ messages });
-      // Additional server logic (e.g., marking messages as read)
+
+      // Mark messages as read
       await markMessagesAsRead(otherUserId, socket.userId!);
       const newUnreadCount = await getUnreadCount(socket.userId!);
       io.to(`user:${socket.userId}`).emit("unread_count", newUnreadCount);
@@ -382,7 +441,8 @@ io.on("connection", async (socket) => {
       callback({ error: "Failed to load chat history" });
     }
   });
-  // Fix 4: Add validation and better error handling to send_message
+
+  // Fix 7: Enhanced validation and error handling for send_message
   socket.on(
     "send_message",
     async (data: { receiverId: string; content: string }) => {
@@ -392,20 +452,28 @@ io.on("connection", async (socket) => {
         );
         const { receiverId, content } = data;
 
-        // Validation
-        if (!receiverId) {
+        // Enhanced validation
+        if (!receiverId || typeof receiverId !== "string") {
           socket.emit("error", { message: "Receiver ID is required" });
           return;
         }
 
-        if (!content || !content.trim()) {
+        if (!content || typeof content !== "string" || !content.trim()) {
           console.warn(`⚠️ Empty message content from user ${socket.userId}`);
           socket.emit("error", { message: "Message content cannot be empty" });
           return;
         }
 
         if (content.trim().length > 1000) {
-          socket.emit("error", { message: "Message too long" });
+          socket.emit("error", {
+            message: "Message too long (max 1000 characters)",
+          });
+          return;
+        }
+
+        // Prevent self-messaging
+        if (receiverId === socket.userId) {
+          socket.emit("error", { message: "Cannot send message to yourself" });
           return;
         }
 
@@ -485,10 +553,15 @@ io.on("connection", async (socket) => {
     }
   );
 
-  // Handle typing indicators
+  // Fix 8: Better validation for typing indicators
   socket.on("typing_start", async (data: { receiverId: string }) => {
     try {
       const { receiverId } = data;
+
+      if (!receiverId || typeof receiverId !== "string") {
+        return;
+      }
+
       const roomId = getRoomId(socket.userId!, receiverId);
 
       // Set typing indicator with expiration
@@ -506,6 +579,11 @@ io.on("connection", async (socket) => {
   socket.on("typing_stop", async (data: { receiverId: string }) => {
     try {
       const { receiverId } = data;
+
+      if (!receiverId || typeof receiverId !== "string") {
+        return;
+      }
+
       const roomId = getRoomId(socket.userId!, receiverId);
 
       // Remove typing indicator
@@ -520,10 +598,16 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // Handle marking messages as read
+  // Fix 9: Better validation for mark_read
   socket.on("mark_read", async (data: { senderId: string }) => {
     try {
       const { senderId } = data;
+
+      if (!senderId || typeof senderId !== "string") {
+        socket.emit("error", { message: "Invalid sender ID" });
+        return;
+      }
+
       await markMessagesAsRead(senderId, socket.userId!);
 
       const unreadCount = await getUnreadCount(socket.userId!);
@@ -538,10 +622,11 @@ io.on("connection", async (socket) => {
       }
     } catch (error) {
       console.error("Error marking messages as read:", error);
+      socket.emit("error", { message: "Failed to mark messages as read" });
     }
   });
 
-  // Fix 5: Optimized get_conversations handler
+  // Fix 10: Optimized get_conversations handler with better error handling
   socket.on("get_conversations", async () => {
     try {
       console.log(`📋 Getting conversations for user ${socket.userId}`);
@@ -563,53 +648,70 @@ io.on("connection", async (socket) => {
     }
   });
 
-  //Handle Old Messages
-  socket.on("load_more_messages", async (data) => {
-    try {
-      const { otherUserId, before } = data;
-      if (!otherUserId || !before) {
-        socket.emit("error", { message: "Invalid parameters" });
-        return;
-      }
+  // Fix 11: Enhanced validation for load_more_messages
+  socket.on(
+    "load_more_messages",
+    async (data: { otherUserId: string; before: string }) => {
+      try {
+        const { otherUserId, before } = data;
 
-      const roomId = getRoomId(socket.userId!, otherUserId);
-      if (!socket.rooms.has(roomId)) {
-        socket.emit("error", { message: "Not in chat room" });
-        return;
-      }
+        // Validation
+        if (!otherUserId || typeof otherUserId !== "string") {
+          socket.emit("error", { message: "Invalid user ID" });
+          return;
+        }
 
-      const olderMessages = await prisma.message.findMany({
-        where: {
-          OR: [
-            { senderId: socket.userId, receiverId: otherUserId },
-            { senderId: otherUserId, receiverId: socket.userId },
-          ],
-          createdAt: { lt: new Date(before) },
-        },
-        include: {
-          sender: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-              image: true,
+        if (!before || typeof before !== "string") {
+          socket.emit("error", { message: "Invalid timestamp" });
+          return;
+        }
+
+        // Validate date
+        const beforeDate = new Date(before);
+        if (isNaN(beforeDate.getTime())) {
+          socket.emit("error", { message: "Invalid timestamp format" });
+          return;
+        }
+
+        const roomId = getRoomId(socket.userId!, otherUserId);
+        if (!socket.rooms.has(roomId)) {
+          socket.emit("error", { message: "Not in chat room" });
+          return;
+        }
+
+        const olderMessages = await prisma.message.findMany({
+          where: {
+            OR: [
+              { senderId: socket.userId, receiverId: otherUserId },
+              { senderId: otherUserId, receiverId: socket.userId },
+            ],
+            createdAt: { lt: beforeDate },
+          },
+          include: {
+            sender: {
+              select: {
+                id: true,
+                name: true,
+                username: true,
+                image: true,
+              },
             },
           },
-        },
-        orderBy: { createdAt: "desc" },
-        take: 50,
-      });
+          orderBy: { createdAt: "desc" },
+          take: 50,
+        });
 
-      // Reverse to send messages in ascending order (oldest first)
-      const sortedOlderMessages = olderMessages.reverse();
-      socket.emit("more_messages", sortedOlderMessages);
-    } catch (error) {
-      console.error("Error loading more messages:", error);
-      socket.emit("error", { message: "Failed to load more messages" });
+        // Reverse to send messages in ascending order (oldest first)
+        const sortedOlderMessages = olderMessages.reverse();
+        socket.emit("more_messages", sortedOlderMessages);
+      } catch (error) {
+        console.error("Error loading more messages:", error);
+        socket.emit("error", { message: "Failed to load more messages" });
+      }
     }
-  });
+  );
 
-  // Handle disconnect with enhanced logic
+  // Fix 12: Enhanced disconnect handling with proper cleanup
   socket.on("disconnect", async (reason) => {
     try {
       console.log(`👋 User ${socket.userId} disconnected: ${reason}`);
@@ -618,7 +720,7 @@ io.on("connection", async (socket) => {
       if (
         reason === "transport error" ||
         reason === "transport close" ||
-        reason == "client namespace disconnect"
+        reason === "client namespace disconnect"
       ) {
         console.log(
           `⏳ Delaying cleanup for user ${socket.userId} due to transport issue`
@@ -634,7 +736,7 @@ io.on("connection", async (socket) => {
 
             // Clean up only if this socket is still the active one (user hasn't reconnected)
             if (currentSocketId === socket.id) {
-              await cleanup();
+              await cleanupUserSocket(socket.userId!);
             } else {
               console.log(
                 `🔄 User ${socket.userId} has reconnected, skipping cleanup`
@@ -648,8 +750,8 @@ io.on("connection", async (socket) => {
           }
         }, 8000);
       } else {
-        // For normal disconnects (client close, server shutdown, etc.), clean up immediately
-        await cleanup();
+        // For normal disconnects, clean up immediately
+        await cleanupUserSocket(socket.userId!);
       }
     } catch (error) {
       console.error(
@@ -664,11 +766,58 @@ io.on("connection", async (socket) => {
   });
 });
 
-// Cleanup function for graceful shutdown
-const cleanup = async () => {
-  await prisma.$disconnect();
-  await redis.quit();
-  httpServer.close();
+// Fix 13: Separate cleanup function for user socket
+const cleanupUserSocket = async (userId: string): Promise<void> => {
+  try {
+    console.log(`🧹 Cleaning up socket for user ${userId}`);
+
+    // Remove user from socket mapping
+    await redis.hdel(USER_SOCKET_KEY, userId);
+
+    // Clean up any typing indicators for this user
+    const typingKeys = await redis.keys(`${TYPING_PREFIX}*:${userId}`);
+    if (typingKeys.length > 0) {
+      await redis.del(...typingKeys);
+    }
+
+    console.log(`✅ Cleanup completed for user ${userId}`);
+  } catch (error) {
+    console.error(`❌ Error during cleanup for user ${userId}:`, error);
+  }
+};
+
+// Fix 14: Enhanced cleanup function for graceful shutdown
+const cleanup = async (): Promise<void> => {
+  console.log("🛑 Initiating graceful shutdown...");
+
+  try {
+    // Close Socket.IO server
+    io.close();
+    console.log("✅ Socket.IO server closed");
+
+    // Disconnect from Prisma
+    await prisma.$disconnect();
+    console.log("✅ Database disconnected");
+
+    // Quit Redis connection
+    await redis.quit();
+    console.log("✅ Redis disconnected");
+
+    // Close HTTP server
+    httpServer.close(() => {
+      console.log("✅ HTTP server closed");
+      process.exit(0);
+    });
+
+    // Force exit after 10 seconds if graceful shutdown fails
+    setTimeout(() => {
+      console.error("❌ Forced shutdown after timeout");
+      process.exit(1);
+    }, 10000);
+  } catch (error) {
+    console.error("❌ Error during cleanup:", error);
+    process.exit(1);
+  }
 };
 
 process.on("SIGINT", cleanup);
@@ -686,14 +835,17 @@ httpServer.listen(PORT, () => {
 // Add error handling for the server
 httpServer.on("error", (error) => {
   console.error("❌ HTTP Server error:", error);
+  process.exit(1);
 });
 
 // Add unhandled rejection and exception handlers
 process.on("unhandledRejection", (reason, promise) => {
   console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
+  process.exit(1);
 });
 
 process.on("uncaughtException", (error) => {
   console.error("❌ Uncaught Exception:", error);
   console.error("Stack trace:", error.stack);
+  process.exit(1);
 });
