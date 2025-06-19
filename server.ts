@@ -369,6 +369,7 @@ io.on("connection", async (socket) => {
   }
 
   // Fix 6: Better error handling and validation for join_chat
+  // Enhanced join_chat handler with better user information
   socket.on("join_chat", async (data: { otherUserId: string }, callback) => {
     try {
       const { otherUserId } = data;
@@ -380,10 +381,15 @@ io.on("connection", async (socket) => {
         return;
       }
 
-      // Verify other user exists
+      // Verify other user exists and get their info
       const otherUser = await prisma.user.findUnique({
         where: { id: otherUserId },
-        select: { id: true },
+        select: {
+          id: true,
+          name: true,
+          username: true,
+          image: true,
+        },
       });
 
       if (!otherUser) {
@@ -429,13 +435,27 @@ io.on("connection", async (socket) => {
         }
       }
 
-      // Send messages back via callback
-      callback({ messages });
+      // Enhanced response with user info for new chats
+      callback({
+        messages,
+        otherUser: {
+          id: otherUser.id,
+          name: otherUser.name,
+          username: otherUser.username,
+          image: otherUser.image,
+        },
+        roomId,
+        isNewChat: messages.length === 0,
+      });
 
       // Mark messages as read
       await markMessagesAsRead(otherUserId, socket.userId!);
       const newUnreadCount = await getUnreadCount(socket.userId!);
       io.to(`user:${socket.userId}`).emit("unread_count", newUnreadCount);
+
+      console.log(
+        `✅ User ${socket.userId} joined chat with ${otherUserId}, messages: ${messages.length}`
+      );
     } catch (error) {
       console.error(`❌ Error in join_chat for user ${socket.userId}:`, error);
       callback({ error: "Failed to load chat history" });
