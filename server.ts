@@ -74,7 +74,7 @@ try {
   prisma
     .$connect()
     .then(() => console.log("✅ Database connected successfully"))
-    .catch((err) => console.error("❌ Database connection error:", err));
+    .catch((err: any) => console.error("❌ Database connection error:", err));
 } catch (error) {
   console.error("❌ Failed to initialize clients:", error);
   process.exit(1);
@@ -86,7 +86,7 @@ const httpServer = createServer(app);
 // CORS middleware
 app.use(
   cors({
-    origin: process.env.CLIENT_URL!,
+    origin: true,
     // || "http://localhost:3000",
     credentials: true,
   })
@@ -111,8 +111,8 @@ app.get("/api/me", async (req, res) => {
 // Socket.IO setup
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL!,
-      // || "http://localhost:3000",
+    origin: true,
+    // || "http://localhost:3000",
     methods: ["GET", "POST"],
     credentials: true,
   },
