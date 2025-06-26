@@ -1,11 +1,12 @@
 import { createServer } from "node:http";
 import { Server } from "socket.io";
-import { auth } from "./auth";
+// import { auth } from "./auth";
 import express from "express";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { PrismaClient } from "@prisma/client";
 import Redis from "ioredis";
 import cors from "cors";
+import jwt from "jsonwebtoken";
 import { Socket } from "socket.io";
 
 // Extend the Socket interface to include custom properties
@@ -93,26 +94,26 @@ app.use(
 );
 
 // Better Auth handler
-app.all("/api/auth/*splat", toNodeHandler(auth));
-app.use(express.json());
+// app.all("/api/auth/*splat", toNodeHandler(auth));
+// app.use(express.json());
 
 // Session endpoint
-app.get("/api/me", async (req, res) => {
-  try {
-    const session = await auth.api.getSession({
-      headers: fromNodeHeaders(req.headers),
-    });
-    res.json(session);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to get session" });
-  }
-});
+// app.get("/api/me", async (req, res) => {
+//   try {
+//     const session = await auth.api.getSession({
+//       headers: fromNodeHeaders(req.headers),
+//     });
+//     res.json(session);
+//   } catch (error) {
+//     res.status(500).json({ error: "Failed to get session" });
+//   }
+// });
 
 // Socket.IO setup
 const io = new Server(httpServer, {
   cors: {
     origin: process.env.CLIENT_URL!,
-      // || "http://localhost:3000",
+    // || "http://localhost:3000",
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -130,21 +131,44 @@ io.use(async (socket, next) => {
     console.log("🔐 Authenticating socket connection...");
     console.log("Headers:", JSON.stringify(socket.handshake.headers, null, 2));
 
-    const session = await auth.api.getSession({
-      headers: fromNodeHeaders(socket.handshake.headers),
-    });
+    // const session = await auth.api.getSession({
+    //   headers: fromNodeHeaders(socket.handshake.headers),
+    // });
 
-    console.log("📋 Session data:", JSON.stringify(session, null, 2));
+    // console.log("📋 Session data:", JSON.stringify(session, null, 2));
 
-    if (!session?.user) {
-      console.error("❌ Authentication failed: No user session found");
-      return next(new Error("Authentication required"));
+    // if (!session?.user) {
+    //   console.error("❌ Authentication failed: No user session found");
+    //   return next(new Error("Authentication required"));
+    // }
+
+    // socket.userId = session.user.id;
+    // socket.userEmail = session.user.email;
+    // console.log(
+    //   `✅ User authenticated: ${session.user.id} (${session.user.email})`
+    // );
+    // next();
+
+    const token = socket.handshake.auth.token;
+    if (!token || typeof token != "string") {
+      return new Error("Authenetication Token Required.");
     }
+    const decoded = jwt.verify(token, process.env.WEBSOCKET_AUTH_SECRET!) as {
+      userId: string;
+    };
+    socket.userId = decoded.userId;
 
-    socket.userId = session.user.id;
-    socket.userEmail = session.user.email;
+    const user = await prisma.user.findUnique({
+      where: { id: socket.userId },
+      select: { id: true, email: true },
+    });
+    if (!user) {
+      return next(new Error("User not found"));
+    }
+    socket.userEmail = user.email;
+
     console.log(
-      `✅ User authenticated: ${session.user.id} (${session.user.email})`
+      `✅ User authenticated: ${socket.userId} (${socket.userEmail})`
     );
     next();
   } catch (error) {
